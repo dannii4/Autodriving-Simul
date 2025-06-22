@@ -1,0 +1,259 @@
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import numpy as np
+from collections import deque
+
+# 하이퍼파라미터 설정 (조정 가능!)
+BUFFER_SIZE = 5000         # 경험 다양성 확보
+BATCH_SIZE = 32
+GAMMA = 0.99               # 장기적인 보상 중요도 증가
+LEARNING_RATE = 0.001
+TARGET_UPDATE_FREQ = 10    # 타겟 네트워크 업데이트 주기 늘려 안정성 확보
+EPSILON_START = 1.0
+EPSILON_END = 0.01
+EPSILON_DECAY = 0.95
+
+# GPU 사용 가능 여부 확인
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"사용 장치: {device}")
+
+# Q-Network 모델 정의
+# CarRacing-v3의 상태(observation)는 96x96 픽셀의 이미지입니다 (RGB).
+# 이 이미지를 처리하기 위해 CNN(합성곱 신경망)을 사용
+
+# 행동 공간은 [스티어링(-1~1), 가속(0~1), 브레이크(0~1)]로 구성된 3차원 연속 값
+# DQN은 기본적으로 이산적인 행동 공간에 적용됩니다.
+# 따라서 연속적인 행동 공간을 몇 개의 대표적인 구간으로 이산화하는 방식이 필요
+
+# 간단히 4개의 이산 행동만 정의하여 사용
+# 행동 0: [ 0, 1, 0] (직진)
+# 행동 1: [-1, 0, 0] (좌회전)
+# 행동 2: [ 1, 0, 0] (우회전)
+# 행동 3: [ 0, 0, 1] (브레이크)
+
+# 총 4개의 이산 행동을 가정하므로 Q-Network의 출력 뉴런 수 4
+
+ACTION_DIM = 4 # 이산화된 행동의 개수 (직진, 좌회전, 우회전, 브레이크)
+
+class DQNetwork(nn.Module):
+    def __init__(self, action_dim):
+        super(DQNetwork, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=8, stride=4), # 96 -> (96-8)/4 + 1 = 23
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), # 23 -> (23-4)/2 + 1 = 10.5 -> 10 (내림)
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), # 10 -> (10-3)/1 + 1 = 8
+            nn.ReLU()
+        )
+        # CNN 출력 크기 계산: 64 채널 * 8 * 8 = 4096
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 8 * 8, 512),
+            nn.ReLU(),
+            nn.Linear(512, action_dim) # 각 행동에 대한 Q값 출력
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 3, 1, 2)
+        x = self.conv(x)
+        x = x.reshape(x.size(0), -1)
+        q_values = self.fc(x)
+        return q_values
+
+# 경험 리플레이 버퍼 클래스 정의
+# 학습에 사용할 (상태, 행동, 보상, 다음 상태, 종료 여부) 샘플들 저장
+class ReplayBuffer:
+    def __init__(self, buffer_size, device):
+        self.buffer = deque(maxlen=buffer_size)
+        self.device=device
+
+    # action 매개변수 이름을 action_index로 변경하고, 저장하는 값도 변경
+    def add(self, state, action_index, reward, next_state, done):  # 매개변수 변경
+        # 버퍼에 (상태, 이산 행동 인덱스, 보상, 다음 상태, 종료 여부) 저장 <-- 저장하는 값 변경
+        self.buffer.append((state, action_index, reward, next_state, done))
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, action_indices, rewards, next_states, dones = zip(*batch)
+
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(self.device)
+        actions_tensor = torch.tensor(action_indices, dtype=torch.long).to(self.device)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(self.device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(self.device)
+        dones = torch.tensor(np.array(dones), dtype=torch.float32).to(self.device)
+
+        return states, actions_tensor, rewards, next_states, dones
+
+    def __len__(self):
+        return len(self.buffer)
+
+class DQNAgent:
+    def __init__(self, action_dim, buffer_size, batch_size, gamma, epsilon_start, epsilon_end, epsilon_decay, learning_rate, target_update_freq, device):
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.batch_size = batch_size
+        self.target_update_freq = target_update_freq
+        self.device = device
+
+        # Q-Network와 Target Q-Network 생성
+        # Target Network는 학습 안정화를 위해 사용
+        self.q_network = DQNetwork(action_dim).to(device)
+        self.target_q_network = DQNetwork(action_dim).to(device)
+        self.target_q_network.load_state_dict(self.q_network.state_dict()) # 초기에는 Q-Network와 동일하게 설정
+        self.target_q_network.eval() # 타겟 네트워크는 학습하지 않음
+
+        # 옵티마이저 설정 (신경망의 가중치를 업데이트하는 역할)
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
+
+        # 손실 함수 설정 (예측한 Q값과 실제 목표 Q값의 차이를 계산)
+        self.criterion = nn.MSELoss() # 평균 제곱 오차 사용
+
+        # 경험 리플레이 버퍼 생성
+        self.replay_buffer = ReplayBuffer(buffer_size, self.device)
+
+        self.num_learn_steps = 0 # 학습 스텝 횟수 기록
+
+    def select_action(self, state):
+        # 상태를 PyTorch 텐서로 변환하고 장치로 이동
+        state_tensor = torch.tensor(np.array([state]), dtype=torch.float32).to(self.device)
+
+        # 탐험(Exploration) vs 활용(Exploitation)
+        if random.random() < self.epsilon:
+            # 이산화된 행동 중 무작위 선택 (0부터 ACTION_DIM-1 사이의 정수)
+            action_idx = random.randrange(self.action_dim)
+        else:
+            self.q_network.eval()
+            with torch.no_grad():
+                q_values = self.q_network(state_tensor)
+                action_idx = torch.argmax(q_values).item()
+            self.q_network.train()
+
+        if action_idx == 0:  # 직진
+            continuous_action = [0.0, 1.0, 0.0]  # 스티어링, 가속, 브레이크
+        elif action_idx == 1:  # 좌회전
+            continuous_action = [-1.0, 0.0, 0.0]
+        elif action_idx == 2:  # 우회전
+            continuous_action = [1.0, 0.0, 0.0]
+        elif action_idx == 3:  # 브레이크
+            continuous_action = [0.0, 0.0, 1.0]
+        else:
+            continuous_action = [0.0, 0.0, 0.0]
+
+        # CarRacing 환경의 행동은 numpy 배열 형태를 기대할 수 있으므로 변환
+        return action_idx, np.array(continuous_action, dtype=np.float32)
+
+    # 학습 함수
+    def learn(self):
+        # 경험 리플레이 버퍼에 충분한 샘플이 없으면 학습하지 않음
+        if len(self.replay_buffer) < self.batch_size:
+            return
+
+        # 버퍼에서 미니배치 샘플링
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+
+        # Q-Network에서 현재 상태에 대한 Q값 예측
+        # gather(1, actions.unsqueeze(1))는 각 샘플에서 선택된 행동(actions)에 해당하는 Q값만 추출
+        current_q_values = self.q_network(states).gather(1, actions.unsqueeze(1))
+
+        # Target Q-Network에서 다음 상태에 대한 최대 Q값 예측
+        next_q_values = self.target_q_network(next_states).max(1)[0].detach()
+
+        # DQN 목표 Q값 계산 : 목표 Q값 = 현재 보상 + 할인율 * 다음 상태의 최대 Q값 * (1 - 종료 여부)
+        # 에피소드가 종료되면 (dones=1.0) 다음 상태의 Q값은 고려하지 않습니다.
+        target_q_values = rewards + self.gamma * next_q_values * (1 - dones)
+
+        # 손실 계산 (예측 Q값과 목표 Q값의 차이)
+        # current_q_values는 (batch_size, 1) 형태이고, target_q_values는 (batch_size,) 형태이므로 target_q_values를 (batch_size, 1) 형태로 맞춰줌
+        loss = self.criterion(current_q_values, target_q_values.unsqueeze(1))
+
+        # 신경망 업데이트 (역전파 및 옵티마이저 스텝)
+        self.optimizer.zero_grad() # 이전 기울기 초기화
+        loss.backward()            # 손실 함수에 대한 기울기 계산
+        self.optimizer.step()      # 가중치 업데이트
+
+        self.num_learn_steps += 1
+
+        # 타겟 네트워크 업데이트
+        if self.num_learn_steps % self.target_update_freq == 0:
+            self.target_q_network.load_state_dict(self.q_network.state_dict())
+
+    # 에피소드가 끝날 때마다 탐험 확률(epsilon) 감소
+    def update_epsilon(self):
+        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+
+
+# 환경 생성
+env = gym.make('CarRacing-v3', render_mode='human')
+
+# 에이전트 생성
+agent = DQNAgent(
+    action_dim=ACTION_DIM, # 이산화된 행동 개수 (위에서 4로 설정)
+    buffer_size=BUFFER_SIZE,
+    batch_size=BATCH_SIZE,
+    gamma=GAMMA,
+    epsilon_start=EPSILON_START,
+    epsilon_end=EPSILON_END,
+    epsilon_decay=EPSILON_DECAY,
+    learning_rate=LEARNING_RATE,
+    target_update_freq=TARGET_UPDATE_FREQ,
+    device=device
+)
+
+# 학습 루프
+num_training_episodes = 50 # 학습할 에피소드 수 (이 숫자를 늘리면 점점 발전하는 모습을 볼 수 있어요!)
+
+for episode in range(num_training_episodes):
+    print(f"--- Episode {episode + 1} 시작! ---")
+
+    # 환경 초기화
+    observation, info = env.reset()
+    state = observation # 초기 상태 설정
+
+    terminated = False
+    truncated = False
+    total_reward = 0
+
+    # 에피소드 진행
+
+    num_training_episodes = 50
+
+    for episode in range(num_training_episodes):
+        print(f"--- Episode {episode + 1} 시작! ---")
+
+        obs, _ = env.reset()
+        total_reward = 0
+        done = False
+
+        while not done:
+            # 행동 선택
+            action_idx, action = agent.select_action(obs)
+
+            # 환경에 행동 적용
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            # 경험 저장
+            agent.replay_buffer.add(obs, action_idx, reward, next_obs, done)
+
+            # 학습
+            agent.learn()
+
+            # 상태 업데이트
+            obs = next_obs
+            total_reward += reward
+
+        # epsilon 감소
+        agent.update_epsilon()
+
+        print(f"Episode {episode + 1} 종료 - 총 보상: {total_reward:.2f}, epsilon: {agent.epsilon:.4f}")
+
+
+# 학습 종료 후 환경 종료
+env.close()
+print("학습 및 시뮬레이션 종료.")
